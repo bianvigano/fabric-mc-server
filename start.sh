@@ -13,6 +13,39 @@ JAVA_XMS="${JAVA_XMS:-1G}"
 JAVA_XMX="${JAVA_XMX:-2G}"
 JAVA_FLAGS="-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200"
 PID_FILE=".server.pid"
+SERVER_PROPERTIES="server.properties"
+
+# --- Config helpers: read/write server.properties ---
+prop_get() {
+    local key="$1"
+    grep "^${key}=" "$SERVER_PROPERTIES" 2>/dev/null | tail -1 | cut -d= -f2-
+}
+
+prop_set() {
+    local key="$1"
+    local value="$2"
+    if grep -q "^${key}=" "$SERVER_PROPERTIES" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$SERVER_PROPERTIES"
+    else
+        echo "${key}=${value}" >> "$SERVER_PROPERTIES"
+    fi
+}
+
+# --- Server port ---
+SERVER_PORT="${SERVER_PORT:-$(prop_get server-port)}"
+SERVER_PORT="${SERVER_PORT:-25565}"
+
+# --- Pre-start: kill anything on the configured port ---
+kill_port() {
+    local port="$1"
+    local pids
+    pids=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -oP 'pid=\K[0-9]+' | sort -u)
+    if [ -n "$pids" ]; then
+        echo "[!] Port $port sudah dipakai. Killing: $pids"
+        kill -9 $pids 2>/dev/null || true
+        sleep 2
+    fi
+}
 
 # Auto-detect server jar
 if [ -z "$SERVER_JAR" ]; then
@@ -63,9 +96,17 @@ do_start() {
         echo "[*] Server sudah jalan ($BACKEND: $SESSION_NAME)"
         return
     fi
+
+    # Handle port config
+    if [ -n "$SERVER_PORT" ]; then
+        prop_set "server-port" "$SERVER_PORT"
+        kill_port "$SERVER_PORT"
+    fi
+
     echo "[*] Starting Fabric server..."
     echo "    Jar: $SERVER_JAR"
     echo "    RAM: $JAVA_XMS - $JAVA_XMX"
+    echo "    Port: $SERVER_PORT"
     echo "    Backend: $BACKEND"
 
     case "$BACKEND" in
@@ -171,24 +212,77 @@ do_console() {
     esac
 }
 
+do_config() {
+    local key="$2"
+    local value="$3"
+
+    if [ -z "$key" ]; then
+        echo "Current server.properties:"
+        echo "---"
+        grep -v "^#" "$SERVER_PROPERTIES" | grep -v "^$" | head -20
+        echo "---"
+        echo "Usage: $0 config <key> <value>"
+        echo ""
+        echo "Common keys:"
+        echo "  server-port      Port (default: 25565)"
+        echo "  gamemode         survival/creative/adventure/spectator"
+        echo "  difficulty       peaceful/easy/normal/hard"
+        echo "  max-players      Max players"
+        echo "  motd             Server name"
+        echo "  online-mode      true/false"
+        echo "  pvp              true/false"
+        echo "  level-seed       World seed"
+        echo "  level-name       World folder name"
+        echo "  view-distance    Chunk render distance"
+        echo "  simulation-distance"
+        echo "  white-list       true/false"
+        echo "  enforce-whitelist true/false"
+        return
+    fi
+
+    if [ -z "$value" ]; then
+        # Read mode
+        local current
+        current=$(prop_get "$key")
+        echo "$key = ${current:-<not set>}"
+    else
+        # Write mode
+        prop_set "$key" "$value"
+        echo "[*] Set $key = $value"
+    fi
+}
+
 case "${1}" in
     start)          do_start ;;
     stop)           do_stop ;;
     restart)        do_stop; sleep 2; do_start ;;
     status)         do_status ;;
     console|attach) do_console ;;
+    config)         do_config "$2" "$3" "$4" ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|console}"
+        echo "Usage: $0 {start|stop|restart|status|console|config}"
+        echo ""
+        echo "Commands:"
+        echo "  start           Start server"
+        echo "  stop            Stop server"
+        echo "  restart         Restart server"
+        echo "  status          Check status"
+        echo "  console         View console / tail log"
+        echo "  config <k> <v>  Read/set server.properties"
         echo ""
         echo "Env vars:"
         echo "  JAVA_XMS       Min RAM  (default: 1G)"
         echo "  JAVA_XMX       Max RAM  (default: 2G)"
+        echo "  SERVER_PORT    Override port (auto-kill old process)"
         echo "  SERVER_JAR     Path to jar (auto-detected)"
         echo "  FORCE_BACKEND  tmux|screen|nohup (auto-detected)"
         echo ""
         echo "Examples:"
         echo "  ./start.sh start"
         echo "  JAVA_XMX=4G ./start.sh start"
-        echo "  FORCE_BACKEND=nohup ./start.sh start"
+        echo "  SERVER_PORT=25566 ./start.sh start"
+        echo "  ./start.sh config server-port 25566"
+        echo "  ./start.sh config motd \"My Cool Server\""
+        echo "  ./start.sh config difficulty hard"
         ;;
 esac
