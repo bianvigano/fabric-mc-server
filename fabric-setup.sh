@@ -79,34 +79,77 @@ cat > start.sh << STARTEOF
 #!/bin/bash
 # Auto-generated start script for Fabric $MC_VERSION / Loader $LOADER_VERSION
 # Usage: ./start.sh {start|stop|restart|status|console}
+# Auto-detects: tmux > screen > nohup fallback
 
 set -e
 
-SCREEN_NAME="minecraft-fabric"
+SESSION_NAME="minecraft-fabric"
 JAVA_XMS="\${JAVA_XMS:-1G}"
 JAVA_XMX="\${JAVA_XMX:-2G}"
 JAVA_FLAGS="-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200"
 SERVER_JAR="$SERVER_JAR"
+PID_FILE=".server.pid"
+
+# Detect available multiplexer
+detect_backend() {
+    if command -v tmux &>/dev/null; then
+        echo "tmux"
+    elif command -v screen &>/dev/null; then
+        echo "screen"
+    else
+        echo "nohup"
+    fi
+}
+
+BACKEND="\${FORCE_BACKEND:-\$(detect_backend)}"
 
 is_running() {
-    screen -list | grep -q "\$SCREEN_NAME"
+    case "\$BACKEND" in
+        tmux)
+            tmux has-session -t "\$SESSION_NAME" 2>/dev/null
+            ;;
+        screen)
+            screen -list | grep -q "\$SESSION_NAME"
+            ;;
+        nohup)
+            [ -f "\$PID_FILE" ] && kill -0 "\$(cat "\$PID_FILE")" 2>/dev/null
+            ;;
+    esac
 }
 
 do_start() {
     if is_running; then
-        echo "[*] Server sudah jalan. Attach: screen -r \$SCREEN_NAME"
+        echo "[*] Server sudah jalan (\$BACKEND: \$SESSION_NAME)"
         return
     fi
     echo "[*] Starting Fabric server (MC $MC_VERSION, Loader $LOADER_VERSION)..."
     echo "    RAM: \$JAVA_XMS - \$JAVA_XMX"
-    screen -dmS "\$SCREEN_NAME" java \$JAVA_FLAGS -Xms"\$JAVA_XMS" -Xmx"\$JAVA_XMX" -jar "\$SERVER_JAR" nogui
-    sleep 2
+    echo "    Backend: \$BACKEND"
+
+    case "\$BACKEND" in
+        tmux)
+            tmux new-session -d -s "\$SESSION_NAME" "java \$JAVA_FLAGS -Xms\$JAVA_XMS -Xmx\$JAVA_XMX -jar \$SERVER_JAR nogui"
+            echo "    Attach: tmux attach -t \$SESSION_NAME"
+            echo "    Detach: Ctrl+B, D"
+            ;;
+        screen)
+            screen -dmS "\$SESSION_NAME" java \$JAVA_FLAGS -Xms"\$JAVA_XMS" -Xmx"\$JAVA_XMX" -jar "\$SERVER_JAR" nogui
+            echo "    Attach: screen -r \$SESSION_NAME"
+            echo "    Detach: Ctrl+A, D"
+            ;;
+        nohup)
+            mkdir -p logs
+            nohup java \$JAVA_FLAGS -Xms"\$JAVA_XMS" -Xmx"\$JAVA_XMX" -jar "\$SERVER_JAR" nogui > logs/console.log 2>&1 &
+            echo \$! > "\$PID_FILE"
+            echo "    Log: tail -f logs/console.log"
+            ;;
+    esac
+
+    sleep 3
     if is_running; then
-        echo "[*] Server started (screen: \$SCREEN_NAME)"
-        echo "    Attach: screen -r \$SCREEN_NAME"
-        echo "    Detach: Ctrl+A, D"
+        echo "[*] Server started successfully."
     else
-        echo "[ERROR] Server gagal start."
+        echo "[ERROR] Server gagal start. Cek log."
         exit 1
     fi
 }
@@ -114,26 +157,50 @@ do_start() {
 do_stop() {
     if ! is_running; then
         echo "[*] Server tidak jalan."
+        rm -f "\$PID_FILE"
         return
     fi
     echo "[*] Stopping server..."
-    screen -S "\$SCREEN_NAME" -p 0 -X stuff "save-all^M"
-    sleep 2
-    screen -S "\$SCREEN_NAME" -p 0 -X stuff "stop^M"
+
+    case "\$BACKEND" in
+        tmux)
+            tmux send-keys -t "\$SESSION_NAME" "save-all" Enter
+            sleep 2
+            tmux send-keys -t "\$SESSION_NAME" "stop" Enter
+            ;;
+        screen)
+            screen -S "\$SESSION_NAME" -p 0 -X stuff "save-all^M"
+            sleep 2
+            screen -S "\$SESSION_NAME" -p 0 -X stuff "stop^M"
+            ;;
+        nohup)
+            if [ -f "\$PID_FILE" ]; then
+                kill "\$(cat "\$PID_FILE")" 2>/dev/null || true
+            fi
+            ;;
+    esac
+
     for i in \$(seq 1 30); do
         if ! is_running; then
             echo "[*] Server stopped."
+            rm -f "\$PID_FILE"
             return
         fi
         sleep 1
     done
+
     echo "[WARN] Force killing..."
-    screen -S "\$SCREEN_NAME" -X quit
+    case "\$BACKEND" in
+        tmux)   tmux kill-session -t "\$SESSION_NAME" 2>/dev/null || true ;;
+        screen) screen -S "\$SESSION_NAME" -X quit 2>/dev/null || true ;;
+        nohup)  kill -9 "\$(cat "\$PID_FILE")" 2>/dev/null || true ;;
+    esac
+    rm -f "\$PID_FILE"
 }
 
 do_status() {
     if is_running; then
-        echo "[*] Server status: RUNNING"
+        echo "[*] Server status: RUNNING (\$BACKEND: \$SESSION_NAME)"
     else
         echo "[*] Server status: STOPPED"
     fi
@@ -144,27 +211,42 @@ do_console() {
         echo "[*] Server tidak jalan."
         exit 1
     fi
-    echo "[*] Attaching (Ctrl+A, D to detach)..."
-    sleep 1
-    screen -r "\$SCREEN_NAME"
+    case "\$BACKEND" in
+        tmux)
+            echo "[*] Attaching (Ctrl+B, D to detach)..."
+            sleep 1
+            tmux attach -t "\$SESSION_NAME"
+            ;;
+        screen)
+            echo "[*] Attaching (Ctrl+A, D to detach)..."
+            sleep 1
+            screen -r "\$SESSION_NAME"
+            ;;
+        nohup)
+            echo "[*] Tailing console log (Ctrl+C to stop tailing)..."
+            tail -f logs/console.log
+            ;;
+    esac
 }
 
 case "\${1}" in
-    start)    do_start ;;
-    stop)     do_stop ;;
-    restart)  do_stop; sleep 2; do_start ;;
-    status)   do_status ;;
+    start)          do_start ;;
+    stop)           do_stop ;;
+    restart)        do_stop; sleep 2; do_start ;;
+    status)         do_status ;;
     console|attach) do_console ;;
     *)
         echo "Usage: \$0 {start|stop|restart|status|console}"
         echo ""
         echo "Env vars:"
-        echo "  JAVA_XMS    Min RAM  (default: 1G)"
-        echo "  JAVA_XMX    Max RAM  (default: 2G)"
+        echo "  JAVA_XMS       Min RAM  (default: 1G)"
+        echo "  JAVA_XMX       Max RAM  (default: 2G)"
+        echo "  FORCE_BACKEND  tmux|screen|nohup (auto-detected)"
         echo ""
         echo "Examples:"
         echo "  ./start.sh start"
         echo "  JAVA_XMX=4G ./start.sh start"
+        echo "  FORCE_BACKEND=nohup ./start.sh start"
         ;;
 esac
 STARTEOF
@@ -181,8 +263,8 @@ cat > backup.sh << BACKEOF
 
 set -e
 
-SERVER_DIR="$INSTALL_DIR"
-BACKUP_DIR="$BACKUP_DIR"
+SERVER_DIR="$(cd "$(dirname "$0")/" && pwd)"
+BACKUP_DIR="$(dirname "$SERVER_DIR")/minecraft-backups"
 TIMESTAMP=\$(date +%Y%m%d_%H%M%S)
 LABEL="\${1:-manual}"
 BACKUP_NAME="fabric-mc${MC_VERSION}-\${LABEL}-\${TIMESTAMP}"
@@ -191,13 +273,21 @@ MAX_BACKUPS="\${MAX_BACKUPS:-24}"
 mkdir -p "\$BACKUP_DIR"
 
 echo "[*] Starting backup: \$BACKUP_NAME"
+echo "    From: \$SERVER_DIR"
+echo "    To:   \$BACKUP_DIR"
 
 # Tell server to save
-if screen -list | grep -q "minecraft-fabric"; then
+if screen -list | grep -q "minecraft-fabric" 2>/dev/null; then
     screen -S minecraft-fabric -p 0 -X stuff "say [Backup] Starting backup...^M"
     screen -S minecraft-fabric -p 0 -X stuff "save-all^M"
     sleep 5
     screen -S minecraft-fabric -p 0 -X stuff "save-off^M"
+    sleep 3
+elif tmux has-session -t minecraft-fabric 2>/dev/null; then
+    tmux send-keys -t minecraft-fabric "say [Backup] Starting backup..." Enter
+    tmux send-keys -t minecraft-fabric "save-all" Enter
+    sleep 5
+    tmux send-keys -t minecraft-fabric "save-off" Enter
     sleep 3
 fi
 
@@ -211,9 +301,12 @@ tar czf "\$BACKUP_DIR/\${BACKUP_NAME}.tar.gz" \
     .
 
 # Re-enable saves
-if screen -list | grep -q "minecraft-fabric"; then
+if screen -list | grep -q "minecraft-fabric" 2>/dev/null; then
     screen -S minecraft-fabric -p 0 -X stuff "save-on^M"
     screen -S minecraft-fabric -p 0 -X stuff "say [Backup] Done!^M"
+elif tmux has-session -t minecraft-fabric 2>/dev/null; then
+    tmux send-keys -t minecraft-fabric "save-on" Enter
+    tmux send-keys -t minecraft-fabric "say [Backup] Done!" Enter
 fi
 
 # Cleanup old backups
