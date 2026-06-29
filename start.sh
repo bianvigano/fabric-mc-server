@@ -23,15 +23,23 @@ if [ -z "$SERVER_JAR" ]; then
     exit 1
 fi
 
-# Detect available multiplexer
+# Detect available multiplexer (verify it actually works)
 detect_backend() {
     if command -v tmux &>/dev/null; then
-        echo "tmux"
-    elif command -v screen &>/dev/null; then
-        echo "screen"
-    else
-        echo "nohup"
+        if tmux new-session -d -s "__test_$$__" 2>/dev/null; then
+            tmux kill-session -t "__test_$$__" 2>/dev/null
+            echo "tmux"
+            return
+        fi
     fi
+    if command -v screen &>/dev/null; then
+        if screen -dmS "test_$$" true 2>/dev/null; then
+            screen -S "test_$$" -X quit 2>/dev/null
+            echo "screen"
+            return
+        fi
+    fi
+    echo "nohup"
 }
 
 BACKEND="${FORCE_BACKEND:-$(detect_backend)}"
